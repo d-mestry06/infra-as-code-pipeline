@@ -78,20 +78,17 @@ jobs:
 
       - name: Build, tag, and push Docker image
         id: build-push
-        env:
-          ECR_REGISTRY:   ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_STAGING }}
-          IMAGE_TAG:      ${{ github.sha }}
         run: |
-          docker build \
-            --build-arg APP_VERSION="$IMAGE_TAG" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
-            app/
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY_STAGING }}
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build --build-arg APP_VERSION="$IMAGE_TAG" -t "$IMAGE_URI" app/
+          docker push "$IMAGE_URI"
 
-          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "Built and pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Built and pushed: $IMAGE_URI"
 
   # ─────────────────────────────────────────────
   # Job 3: Deploy to Staging
