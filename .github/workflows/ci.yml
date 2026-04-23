@@ -1,0 +1,235 @@
+name: CI — Lint, Build, Deploy to Staging
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_VERSION: "1.6.6"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Terraform Lint & Validate
+  # ─────────────────────────────────────────────
+  terraform-lint:
+    name: Terraform Lint & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive terraform/
+
+      - name: Setup tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Init tflint
+        run: tflint --init
+        working-directory: terraform/environments/staging
+
+      - name: Terraform Init (staging, no backend)
+        working-directory: terraform/environments/staging
+        run: terraform init -backend=false
+
+      - name: Terraform Validate (staging)
+        working-directory: terraform/environments/staging
+        run: terraform validate
+
+      - name: Run tflint (staging)
+        working-directory: terraform/environments/staging
+        run: tflint --format compact
+
+  # ─────────────────────────────────────────────
+  # Job 2: Docker Build & Push to ECR
+  # ─────────────────────────────────────────────
+  docker-build-push:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: terraform-lint
+
+    outputs:
+      image_uri: ${{ steps.build-push.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image
+        id: build-push
+        env:
+          ECR_REGISTRY:   ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_STAGING }}
+          IMAGE_TAG:      ${{ github.sha }}
+        run: |
+          docker build \
+            --build-arg APP_VERSION="$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            app/
+
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Built and pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  # ─────────────────────────────────────────────
+  # Job 3: Deploy to Staging
+  # ─────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Save current task definition (for rollback reference)
+        id: save-current
+        run: |
+          CURRENT_TASK=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER_STAGING }} \
+            --services ${{ secrets.ECS_SERVICE_STAGING }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "current_task_def=$CURRENT_TASK" >> $GITHUB_OUTPUT
+          echo "Current task def: $CURRENT_TASK"
+
+      - name: Download current task definition JSON
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_SERVICE_STAGING }} \
+            --query 'taskDefinition' \
+            > /tmp/task-def.json
+
+      - name: Update image in task definition
+        id: update-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: /tmp/task-def.json
+          container-name:  app
+          image:           ${{ needs.docker-build-push.outputs.image_uri }}
+
+      - name: Deploy to ECS Staging
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:         ${{ steps.update-task-def.outputs.task-definition }}
+          service:                 ${{ secrets.ECS_SERVICE_STAGING }}
+          cluster:                 ${{ secrets.ECS_CLUSTER_STAGING }}
+          wait-for-service-stability: true
+
+      - name: Verify health check
+        run: |
+          echo "Fetching ALB DNS for staging..."
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names staging-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          echo "Checking http://$ALB_DNS/health/check ..."
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/health/check" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i: got $STATUS, retrying in 15s..."
+            sleep 15
+          done
+          echo "Health check failed after 10 attempts"
+          exit 1
+
+      - name: Post staging URL to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const dns = execSync(`aws elbv2 describe-load-balancers --names staging-alb --query 'LoadBalancers[0].DNSName' --output text`).toString().trim();
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Staging Deployment Successful\n\n**URL:** http://${dns}\n**Image:** \`${{ github.sha }}\`\n\nHealthy and ready for review.`
+            });
+        env:
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Slack — staging deploy success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: *Staging deploy succeeded*",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  { "title": "Repo",    "value": "${{ github.repository }}", "short": true },
+                  { "title": "Branch",  "value": "${{ github.head_ref }}",   "short": true },
+                  { "title": "Commit",  "value": "${{ github.sha }}",        "short": true },
+                  { "title": "Actor",   "value": "${{ github.actor }}",      "short": true },
+                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Slack — staging deploy failed
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": ":x: *Staging deploy FAILED*",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  { "title": "Repo",   "value": "${{ github.repository }}", "short": true },
+                  { "title": "Branch", "value": "${{ github.head_ref }}",   "short": true },
+                  { "title": "Commit", "value": "${{ github.sha }}",        "short": true },
+                  { "title": "Actor",  "value": "${{ github.actor }}",      "short": true },
+                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

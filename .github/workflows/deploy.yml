@@ -1,0 +1,296 @@
+name: CD — Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag to deploy (defaults to latest main SHA)"
+        required: false
+        default: ""
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Build & push production image
+  # ─────────────────────────────────────────────
+  build-production-image:
+    name: Build & Push Production Image
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_uri: ${{ steps.build-push.outputs.image_uri }}
+      image_tag: ${{ steps.set-tag.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: set-tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.sha }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to production ECR
+        id: build-push
+        env:
+          ECR_REGISTRY:   ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_PROD }}
+          IMAGE_TAG:      ${{ steps.set-tag.outputs.tag }}
+        run: |
+          docker build \
+            --build-arg APP_VERSION="$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            app/
+
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────
+  # Job 2: Manual approval gate
+  # ─────────────────────────────────────────────
+  production-approval:
+    name: Awaiting Production Approval
+    runs-on: ubuntu-latest
+    needs: build-production-image
+    # GitHub will pause here and email the required reviewers
+    # Configure reviewers in: Settings → Environments → production
+    environment: production
+
+    steps:
+      - name: Approval granted
+        run: |
+          echo "Production deployment approved."
+          echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
+          echo "Tag:   ${{ needs.build-production-image.outputs.image_tag }}"
+
+      - name: Slack — production deploy starting
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": ":rocket: *Production deploy starting*",
+              "attachments": [{
+                "color": "#0066cc",
+                "fields": [
+                  { "title": "Repo",  "value": "${{ github.repository }}", "short": true },
+                  { "title": "Tag",   "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
+                  { "title": "Actor", "value": "${{ github.actor }}",      "short": true },
+                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ─────────────────────────────────────────────
+  # Job 3: Deploy to production + auto-rollback
+  # ─────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-production-image, production-approval]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Save the current task definition ARN so we can roll back ──
+      - name: Save current task definition (rollback target)
+        id: rollback-target
+        run: |
+          CURRENT=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
+            --services ${{ secrets.ECS_SERVICE_PROD }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "task_def=$CURRENT" >> $GITHUB_OUTPUT
+          echo "Rollback target saved: $CURRENT"
+
+      # ── Fetch current task definition JSON ──
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition production-app \
+            --query 'taskDefinition' \
+            > /tmp/prod-task-def.json
+          echo "Task definition downloaded."
+
+      # ── Swap the image ──
+      - name: Render updated task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: /tmp/prod-task-def.json
+          container-name:  app
+          image:           ${{ needs.build-production-image.outputs.image_uri }}
+
+      # ── Register new revision & update service ──
+      - name: Register new task definition revision
+        id: register-task
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ steps.render-task-def.outputs.task-definition }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "new_task_arn=$NEW_ARN" >> $GITHUB_OUTPUT
+          echo "Registered: $NEW_ARN"
+
+      - name: Update ECS service with new task definition
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
+            --service  ${{ secrets.ECS_SERVICE_PROD }} \
+            --task-definition ${{ steps.register-task.outputs.new_task_arn }} \
+            --force-new-deployment
+
+      # ── Wait for stable — 5-minute window ──
+      - name: Wait for deployment to stabilize (5 min timeout)
+        id: wait-stable
+        run: |
+          echo "Waiting for ECS service to become stable..."
+          if aws ecs wait services-stable \
+              --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
+              --services ${{ secrets.ECS_SERVICE_PROD }} \
+              --timeout 300; then
+            echo "stable=true" >> $GITHUB_OUTPUT
+            echo "Deployment stabilized successfully."
+          else
+            echo "stable=false" >> $GITHUB_OUTPUT
+            echo "Deployment did NOT stabilize within timeout."
+          fi
+
+      # ── AUTO-ROLLBACK on failure ──
+      - name: Auto-rollback on health check failure
+        if: steps.wait-stable.outputs.stable == 'false'
+        run: |
+          echo "HEALTH CHECK FAILED — initiating rollback..."
+          echo "Rolling back to: ${{ steps.rollback-target.outputs.task_def }}"
+
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
+            --service  ${{ secrets.ECS_SERVICE_PROD }} \
+            --task-definition ${{ steps.rollback-target.outputs.task_def }} \
+            --force-new-deployment
+
+          echo "Waiting for rollback to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
+            --services ${{ secrets.ECS_SERVICE_PROD }}
+
+          echo "Rollback complete. Service is back on previous version."
+
+      # ── Fail the workflow if rollback was triggered ──
+      - name: Fail pipeline if rollback was triggered
+        if: steps.wait-stable.outputs.stable == 'false'
+        run: |
+          echo "Pipeline failed: deployment was rolled back automatically."
+          exit 1
+
+      # ── Final health check via ALB ──
+      - name: Verify production health via ALB
+        if: steps.wait-stable.outputs.stable == 'true'
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names production-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          echo "Verifying http://$ALB_DNS/health/check ..."
+          for i in {1..6}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/health/check" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "Production health check passed."
+              echo "Live at: http://$ALB_DNS"
+              exit 0
+            fi
+            echo "Attempt $i: got HTTP $STATUS, retrying..."
+            sleep 10
+          done
+          echo "Warning: ALB health check did not return 200 after 6 attempts."
+
+      - name: Deployment summary
+        if: steps.wait-stable.outputs.stable == 'true'
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  PRODUCTION DEPLOYMENT COMPLETE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Image: ${{ needs.build-production-image.outputs.image_uri }}"
+          echo "  Tag:   ${{ needs.build-production-image.outputs.image_tag }}"
+          echo "  Task:  ${{ steps.register-task.outputs.new_task_arn }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: Slack — production deploy succeeded
+        if: steps.wait-stable.outputs.stable == 'true'
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: *Production deploy succeeded*",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  { "title": "Repo",  "value": "${{ github.repository }}", "short": true },
+                  { "title": "Tag",   "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
+                  { "title": "Task",  "value": "${{ steps.register-task.outputs.new_task_arn }}", "short": false },
+                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Slack — production rolled back
+        if: steps.wait-stable.outputs.stable == 'false'
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": ":warning: *Production deploy FAILED — auto-rollback triggered*",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  { "title": "Repo",            "value": "${{ github.repository }}", "short": true },
+                  { "title": "Failed tag",      "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
+                  { "title": "Rolled back to", "value": "${{ steps.rollback-target.outputs.task_def }}", "short": false },
+                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

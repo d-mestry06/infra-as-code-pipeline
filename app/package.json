@@ -1,0 +1,9 @@
+{
+  "name": "@cloudops/ecs-fargate-node-app",
+  "version": "1.0.0",
+  "description": "Node.js app deployed via GitHub Actions to ECS Fargate",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  }
+}
