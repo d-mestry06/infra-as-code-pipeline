@@ -114,16 +114,12 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Save current task definition (for rollback reference)
-        id: save-current
+      - name: Build image URI
+        id: image
         run: |
-          CURRENT_TASK=$(aws ecs describe-services \
-            --cluster ${{ secrets.ECS_CLUSTER_STAGING }} \
-            --services ${{ secrets.ECS_SERVICE_STAGING }} \
-            --query 'services[0].taskDefinition' \
-            --output text)
-          echo "current_task_def=$CURRENT_TASK" >> $GITHUB_OUTPUT
-          echo "Current task def: $CURRENT_TASK"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY_STAGING }}:${{ github.sha }}"
+          echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Image URI: $IMAGE_URI"
 
       - name: Download current task definition JSON
         run: |
@@ -138,7 +134,7 @@ jobs:
         with:
           task-definition: /tmp/task-def.json
           container-name:  app
-          image:           ${{ needs.docker-build-push.outputs.image_uri }}
+          image:           ${{ steps.image.outputs.uri }}
 
       - name: Deploy to ECS Staging
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
