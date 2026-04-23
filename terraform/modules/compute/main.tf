@@ -57,8 +57,8 @@ resource "aws_ecs_task_definition" "app" {
 
       environment = [
         { name = "ENVIRONMENT", value = var.env },
-        { name = "PORT",        value = tostring(var.container_port) },
-        { name = "NODE_ENV",    value = var.env == "production" ? "production" : "development" }
+        { name = "PORT", value = tostring(var.container_port) },
+        { name = "NODE_ENV", value = var.env == "production" ? "production" : "development" }
       ]
 
       logConfiguration = {
@@ -72,7 +72,7 @@ resource "aws_ecs_task_definition" "app" {
       }
 
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:${var.container_port}/health/check || exit 1"]
+        command     = ["CMD-SHELL", "node -e \"require('http').get('http://localhost:${var.container_port}/health/check', r => process.exit(r.statusCode === 200 ? 0 : 1))\""]
         interval    = 30
         timeout     = 5
         retries     = 3
@@ -110,8 +110,8 @@ resource "aws_lb" "main" {
   security_groups    = [var.alb_security_group_id]
   subnets            = var.public_subnet_ids
 
-  enable_deletion_protection    = var.env == "production" ? true : false
-  drop_invalid_header_fields    = true
+  enable_deletion_protection = var.env == "production" ? true : false
+  drop_invalid_header_fields = true
 
   access_logs {
     bucket  = aws_s3_bucket.alb_logs.bucket

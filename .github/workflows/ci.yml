@@ -9,6 +9,10 @@ env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   TF_VERSION: "1.6.6"
 
+permissions:
+  pull-requests: write
+  contents: read
+
 jobs:
   # ─────────────────────────────────────────────
   # Job 1: Terraform Lint & Validate
@@ -78,20 +82,17 @@ jobs:
 
       - name: Build, tag, and push Docker image
         id: build-push
-        env:
-          ECR_REGISTRY:   ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_STAGING }}
-          IMAGE_TAG:      ${{ github.sha }}
         run: |
-          docker build \
-            --build-arg APP_VERSION="$IMAGE_TAG" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
-            app/
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY_STAGING }}
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build --build-arg APP_VERSION="$IMAGE_TAG" -t "$IMAGE_URI" app/
+          docker push "$IMAGE_URI"
 
-          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "Built and pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Built and pushed: $IMAGE_URI"
 
   # ─────────────────────────────────────────────
   # Job 3: Deploy to Staging
@@ -117,16 +118,12 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Save current task definition (for rollback reference)
-        id: save-current
+      - name: Build image URI
+        id: image
         run: |
-          CURRENT_TASK=$(aws ecs describe-services \
-            --cluster ${{ secrets.ECS_CLUSTER_STAGING }} \
-            --services ${{ secrets.ECS_SERVICE_STAGING }} \
-            --query 'services[0].taskDefinition' \
-            --output text)
-          echo "current_task_def=$CURRENT_TASK" >> $GITHUB_OUTPUT
-          echo "Current task def: $CURRENT_TASK"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY_STAGING }}:${{ github.sha }}"
+          echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Image URI: $IMAGE_URI"
 
       - name: Download current task definition JSON
         run: |
@@ -141,7 +138,7 @@ jobs:
         with:
           task-definition: /tmp/task-def.json
           container-name:  app
-          image:           ${{ needs.docker-build-push.outputs.image_uri }}
+          image:           ${{ steps.image.outputs.uri }}
 
       - name: Deploy to ECS Staging
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
