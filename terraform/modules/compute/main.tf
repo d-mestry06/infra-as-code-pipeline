@@ -57,8 +57,8 @@ resource "aws_ecs_task_definition" "app" {
 
       environment = [
         { name = "ENVIRONMENT", value = var.env },
-        { name = "PORT",        value = tostring(var.container_port) },
-        { name = "NODE_ENV",    value = var.env == "production" ? "production" : "development" }
+        { name = "PORT", value = tostring(var.container_port) },
+        { name = "NODE_ENV", value = var.env == "production" ? "production" : "development" }
       ]
 
       logConfiguration = {
@@ -110,8 +110,8 @@ resource "aws_lb" "main" {
   security_groups    = [var.alb_security_group_id]
   subnets            = var.public_subnet_ids
 
-  enable_deletion_protection    = var.env == "production" ? true : false
-  drop_invalid_header_fields    = true
+  enable_deletion_protection = var.env == "production" ? true : false
+  drop_invalid_header_fields = true
 
   access_logs {
     bucket  = aws_s3_bucket.alb_logs.bucket

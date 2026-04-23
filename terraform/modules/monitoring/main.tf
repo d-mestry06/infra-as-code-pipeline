@@ -40,7 +40,7 @@ resource "aws_kms_key" "monitoring" {
         Principal = {
           Service = "sns.amazonaws.com"
         }
-        Action = ["kms:Decrypt", "kms:GenerateDataKey*"]
+        Action   = ["kms:Decrypt", "kms:GenerateDataKey*"]
         Resource = "*"
       }
     ]
