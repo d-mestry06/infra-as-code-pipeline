@@ -344,3 +344,4 @@ See [docs/runbook.md](docs/runbook.md) for on-call procedures covering:
 > previous version in under 60 seconds. This eliminated deployment-related outages — from 3 per  
 > month to zero — and reduced deployment time from 1 hour of manual steps to a 5-minute  
 > automated pipeline."
+# Pipeline test

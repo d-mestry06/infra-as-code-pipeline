@@ -46,11 +46,6 @@ resource "aws_kms_key" "monitoring" {
     ]
   })
 
-  tags = {
-    Name        = "${var.env}-monitoring-key"
-    Environment = var.env
-    ManagedBy   = "terraform"
-  }
 }
 
 resource "aws_kms_alias" "monitoring" {
@@ -220,6 +215,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         properties = {
           title  = "ECS CPU & Memory"
           period = 60
+          region = data.aws_region.current.name
           metrics = [
             ["AWS/ECS", "CPUUtilization", "ClusterName", "${var.env}-cluster", "ServiceName", "${var.env}-app"],
             ["AWS/ECS", "MemoryUtilization", "ClusterName", "${var.env}-cluster", "ServiceName", "${var.env}-app"]
@@ -236,6 +232,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         properties = {
           title  = "ALB Request Count & Errors"
           period = 60
+          region = data.aws_region.current.name
           metrics = [
             ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", var.alb_arn_suffix],
             ["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", var.alb_arn_suffix],
