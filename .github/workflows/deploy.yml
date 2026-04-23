@@ -26,6 +26,9 @@ jobs:
       image_tag: ${{ steps.promote.outputs.image_tag }}
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -40,7 +43,7 @@ jobs:
       - name: Promote staging image to production ECR
         id: promote
         env:
-          REGISTRY:    ${{ steps.login-ecr.outputs.registry }}
+          REGISTRY:     ${{ steps.login-ecr.outputs.registry }}
           STAGING_REPO: ${{ secrets.ECR_REPOSITORY_STAGING }}
           PROD_REPO:    ${{ secrets.ECR_REPOSITORY_PROD }}
           INPUT_TAG:    ${{ github.event.inputs.image_tag }}
@@ -49,13 +52,19 @@ jobs:
           STAGING_URI="$REGISTRY/$STAGING_REPO:$TAG"
           PROD_URI="$REGISTRY/$PROD_REPO:$TAG"
 
-          docker pull "$STAGING_URI"
-          docker tag  "$STAGING_URI" "$PROD_URI"
+          if docker pull "$STAGING_URI" 2>/dev/null; then
+            echo "Found staging image, promoting..."
+            docker tag  "$STAGING_URI" "$PROD_URI"
+          else
+            echo "Staging image not found, building from source..."
+            docker build --build-arg APP_VERSION="$TAG" -t "$PROD_URI" app/
+          fi
+
           docker push "$PROD_URI"
 
           echo "image_uri=$PROD_URI" >> $GITHUB_OUTPUT
           echo "image_tag=$TAG"      >> $GITHUB_OUTPUT
-          echo "Promoted: $STAGING_URI → $PROD_URI"
+          echo "Promoted/Built: $PROD_URI"
 
   # ─────────────────────────────────────────────
   # Job 2: Manual approval gate
