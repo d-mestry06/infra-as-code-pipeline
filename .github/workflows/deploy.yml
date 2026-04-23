@@ -14,9 +14,6 @@ env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
 
 jobs:
-  # ─────────────────────────────────────────────
-  # Job 1: Build & push production image
-  # ─────────────────────────────────────────────
   build-production-image:
     name: Promote Staging Image to Production
     runs-on: ubuntu-latest
@@ -40,21 +37,21 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Promote staging image to production ECR
+      - name: Build and push production image
         id: promote
-        env:
-          REGISTRY:     ${{ steps.login-ecr.outputs.registry }}
-          STAGING_REPO: ${{ secrets.ECR_REPOSITORY_STAGING }}
-          PROD_REPO:    ${{ secrets.ECR_REPOSITORY_PROD }}
-          INPUT_TAG:    ${{ github.event.inputs.image_tag }}
         run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          STAGING_REPO="${{ secrets.ECR_REPOSITORY_STAGING }}"
+          PROD_REPO="${{ secrets.ECR_REPOSITORY_PROD }}"
+          INPUT_TAG="${{ github.event.inputs.image_tag }}"
           TAG="${INPUT_TAG:-${{ github.sha }}}"
+
           STAGING_URI="$REGISTRY/$STAGING_REPO:$TAG"
           PROD_URI="$REGISTRY/$PROD_REPO:$TAG"
 
           if docker pull "$STAGING_URI" 2>/dev/null; then
-            echo "Found staging image, promoting..."
-            docker tag  "$STAGING_URI" "$PROD_URI"
+            echo "Promoting staging image to production..."
+            docker tag "$STAGING_URI" "$PROD_URI"
           else
             echo "Staging image not found, building from source..."
             docker build --build-arg APP_VERSION="$TAG" -t "$PROD_URI" app/
@@ -62,13 +59,15 @@ jobs:
 
           docker push "$PROD_URI"
 
-          echo "image_uri=$PROD_URI" >> $GITHUB_OUTPUT
-          echo "image_tag=$TAG"      >> $GITHUB_OUTPUT
-          echo "Promoted/Built: $PROD_URI"
+          printf 'image_uri=%s\n' "$PROD_URI" >> "$GITHUB_OUTPUT"
+          printf 'image_tag=%s\n' "$TAG"      >> "$GITHUB_OUTPUT"
+          echo "Done: $PROD_URI"
 
-  # ─────────────────────────────────────────────
-  # Job 2: Manual approval gate
-  # ─────────────────────────────────────────────
+      - name: Verify outputs
+        run: |
+          echo "image_uri=${{ steps.promote.outputs.image_uri }}"
+          echo "image_tag=${{ steps.promote.outputs.image_tag }}"
+
   production-approval:
     name: Awaiting Production Approval
     runs-on: ubuntu-latest
@@ -78,9 +77,7 @@ jobs:
     steps:
       - name: Approval granted
         run: |
-          echo "Production deployment approved."
-          echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
-          echo "Tag:   ${{ needs.build-production-image.outputs.image_tag }}"
+          echo "Approved. Image: ${{ needs.build-production-image.outputs.image_uri }}"
 
       - name: Slack — production deploy starting
         uses: slackapi/slack-github-action@v1.27.0
@@ -93,8 +90,8 @@ jobs:
                 "fields": [
                   { "title": "Repo",  "value": "${{ github.repository }}", "short": true },
                   { "title": "Tag",   "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
-                  { "title": "Actor", "value": "${{ github.actor }}",      "short": true },
-                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                  { "title": "Actor", "value": "${{ github.actor }}", "short": true },
+                  { "title": "Run",   "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
             }
@@ -102,9 +99,6 @@ jobs:
           SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
-  # ─────────────────────────────────────────────
-  # Job 3: Deploy to production + auto-rollback
-  # ─────────────────────────────────────────────
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
@@ -121,7 +115,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      - name: Save current task definition (rollback target)
+      - name: Save rollback target
         id: rollback-target
         run: |
           CURRENT=$(aws ecs describe-services \
@@ -129,7 +123,7 @@ jobs:
             --services ${{ secrets.ECS_SERVICE_PROD }} \
             --query "services[0].taskDefinition" \
             --output text)
-          echo "task_def=$CURRENT" >> $GITHUB_OUTPUT
+          echo "task_def=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "Rollback target: $CURRENT"
 
       - name: Download current task definition
@@ -138,6 +132,7 @@ jobs:
             --task-definition ${{ secrets.ECS_SERVICE_PROD }} \
             --query "taskDefinition" \
             > /tmp/prod-task-def.json
+          echo "Image to deploy: ${{ needs.build-production-image.outputs.image_uri }}"
 
       - name: Render updated task definition
         id: render-task-def
@@ -155,21 +150,20 @@ jobs:
           cluster:                    ${{ secrets.ECS_CLUSTER_PROD }}
           wait-for-service-stability: false
 
-      - name: Wait for deployment to stabilize (5 min timeout)
+      - name: Wait for stabilization
         id: wait-stable
         run: |
           if aws ecs wait services-stable \
               --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
               --services ${{ secrets.ECS_SERVICE_PROD }}; then
-            echo "stable=true" >> $GITHUB_OUTPUT
+            echo "stable=true" >> "$GITHUB_OUTPUT"
           else
-            echo "stable=false" >> $GITHUB_OUTPUT
+            echo "stable=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Auto-rollback on failure
         if: steps.wait-stable.outputs.stable == 'false'
         run: |
-          echo "ROLLING BACK to: ${{ steps.rollback-target.outputs.task_def }}"
           aws ecs update-service \
             --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
             --service  ${{ secrets.ECS_SERVICE_PROD }} \
@@ -179,11 +173,11 @@ jobs:
             --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
             --services ${{ secrets.ECS_SERVICE_PROD }}
 
-      - name: Fail pipeline if rollback was triggered
+      - name: Fail if rolled back
         if: steps.wait-stable.outputs.stable == 'false'
         run: exit 1
 
-      - name: Verify production health via ALB
+      - name: Verify health via ALB
         if: steps.wait-stable.outputs.stable == 'true'
         run: |
           ALB_DNS=$(aws elbv2 describe-load-balancers \
@@ -199,18 +193,14 @@ jobs:
             echo "Attempt $i: HTTP $STATUS, retrying in 10s..."
             sleep 10
           done
-          echo "Warning: health check did not return 200 after 6 attempts."
 
       - name: Deployment summary
         if: steps.wait-stable.outputs.stable == 'true'
         run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  PRODUCTION DEPLOYMENT COMPLETE"
-          echo "  Image: ${{ needs.build-production-image.outputs.image_uri }}"
-          echo "  Tag:   ${{ needs.build-production-image.outputs.image_tag }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "PRODUCTION DEPLOYMENT COMPLETE"
+          echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
 
-      - name: Slack — production deploy succeeded
+      - name: Slack — succeeded
         if: steps.wait-stable.outputs.stable == 'true'
         uses: slackapi/slack-github-action@v1.27.0
         with:
@@ -220,9 +210,9 @@ jobs:
               "attachments": [{
                 "color": "good",
                 "fields": [
-                  { "title": "Repo",  "value": "${{ github.repository }}", "short": true },
-                  { "title": "Tag",   "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
-                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                  { "title": "Repo", "value": "${{ github.repository }}", "short": true },
+                  { "title": "Tag",  "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
+                  { "title": "Run",  "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
             }
@@ -230,7 +220,7 @@ jobs:
           SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
-      - name: Slack — production rolled back
+      - name: Slack — rolled back
         if: steps.wait-stable.outputs.stable == 'false'
         uses: slackapi/slack-github-action@v1.27.0
         with:
@@ -243,7 +233,7 @@ jobs:
                   { "title": "Repo",           "value": "${{ github.repository }}", "short": true },
                   { "title": "Failed tag",     "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
                   { "title": "Rolled back to", "value": "${{ steps.rollback-target.outputs.task_def }}", "short": false },
-                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                  { "title": "Run",            "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
             }
