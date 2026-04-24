@@ -1,12 +1,19 @@
 name: CD — Deploy to Production
 
+# Triggers only after CI completes successfully on a merge to main.
+# This guarantees the staging ECR image (built during the PR) exists
+# before we attempt to promote it — no rebuild, pure artifact promotion.
 on:
-  push:
+  workflow_run:
+    workflows: ["CI — Lint, Build, Deploy to Staging"]
+    types: [completed]
     branches: [main]
+
+  # Allow manual deploys with an optional image tag override
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Docker image tag to deploy (defaults to latest main SHA)"
+        description: "Docker image tag to deploy (leave blank to use latest main SHA)"
         required: false
         default: ""
 
@@ -15,11 +22,48 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────
-  # Job 1: Build & push production image
+  # Job 1: Gate — abort if upstream CI failed
   # ─────────────────────────────────────────────
-  build-production-image:
+  check-ci-status:
+    name: Check CI Status
+    runs-on: ubuntu-latest
+
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+
+    steps:
+      - name: Abort if CI did not succeed
+        if: >
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion != 'success'
+        run: |
+          echo "Upstream CI conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "Aborting CD — only deploying after a successful CI run."
+          exit 1
+
+      - name: Resolve image tag (SHA)
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            # Manual override
+            SHA="${{ github.event.inputs.image_tag }}"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # SHA of the HEAD commit that triggered CI (the PR merge commit)
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            SHA="${{ github.sha }}"
+          fi
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "Resolved image tag (SHA): $SHA"
+
+  # ─────────────────────────────────────────────
+  # Job 2: Promote staging image → production ECR
+  # Pure tag-and-push, zero rebuild.
+  # ─────────────────────────────────────────────
+  promote-image:
     name: Promote Staging Image to Production
     runs-on: ubuntu-latest
+    needs: check-ci-status
 
     outputs:
       image_uri: ${{ steps.promote.outputs.image_uri }}
@@ -43,49 +87,47 @@ jobs:
           REGISTRY:     ${{ steps.login-ecr.outputs.registry }}
           STAGING_REPO: ${{ secrets.ECR_REPOSITORY_STAGING }}
           PROD_REPO:    ${{ secrets.ECR_REPOSITORY_PROD }}
-          INPUT_TAG:    ${{ github.event.inputs.image_tag || github.sha }}
+          TAG:          ${{ needs.check-ci-status.outputs.sha }}
         run: |
-          
-          TAG="$INPUT_TAG"
-          
-
           STAGING_URI="$REGISTRY/$STAGING_REPO:$TAG"
           PROD_URI="$REGISTRY/$PROD_REPO:$TAG"
-
-          echo "Using TAG: $TAG"
-          echo "Pulling: $STAGING_URI"
+          PROD_LATEST="$REGISTRY/$PROD_REPO:latest"
 
           echo "=============================="
-          echo "Using TAG: $TAG"
-          echo "Staging: $STAGING_URI"
-          echo "Production: $PROD_URI"
+          echo "Promoting: $STAGING_URI"
+          echo "       To: $PROD_URI"
           echo "=============================="
 
-          
+          # Pull the exact image that was tested in staging
           docker pull "$STAGING_URI"
-          echo "Promoting image..."
+
+          # Retag for prod repo and push both SHA and :latest
           docker tag "$STAGING_URI" "$PROD_URI"
+          docker tag "$STAGING_URI" "$PROD_LATEST"
           docker push "$PROD_URI"
-         
+          docker push "$PROD_LATEST"
 
           echo "image_uri=$PROD_URI" >> $GITHUB_OUTPUT
-          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "image_tag=$TAG"      >> $GITHUB_OUTPUT
+          echo "Promotion complete."
 
   # ─────────────────────────────────────────────
-  # Job 2: Manual approval gate
+  # Job 3: Manual approval gate
+  # Requires a GitHub environment named "production"
+  # with a required reviewer configured in repo settings.
   # ─────────────────────────────────────────────
   production-approval:
     name: Awaiting Production Approval
     runs-on: ubuntu-latest
-    needs: build-production-image
+    needs: promote-image
     environment: production
 
     steps:
       - name: Approval granted
         run: |
           echo "Production deployment approved."
-          echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
-          echo "Tag:   ${{ needs.build-production-image.outputs.image_tag }}"
+          echo "Image : ${{ needs.promote-image.outputs.image_uri }}"
+          echo "Tag   : ${{ needs.promote-image.outputs.image_tag }}"
 
       - name: Slack — production deploy starting
         uses: slackapi/slack-github-action@v1.27.0
@@ -97,9 +139,9 @@ jobs:
                 "color": "#0066cc",
                 "fields": [
                   { "title": "Repo",  "value": "${{ github.repository }}", "short": true },
-                  { "title": "Tag",   "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
+                  { "title": "Tag",   "value": "${{ needs.promote-image.outputs.image_tag }}", "short": true },
                   { "title": "Actor", "value": "${{ github.actor }}",      "short": true },
-                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                  { "title": "Run",   "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
             }
@@ -108,16 +150,19 @@ jobs:
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
   # ─────────────────────────────────────────────
-  # Job 3: Deploy to production + auto-rollback
+  # Job 4: Deploy to production + auto-rollback
   # ─────────────────────────────────────────────
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: [build-production-image, production-approval]
+    needs: [promote-image, production-approval]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Checkout the exact commit that was built and tested
+          ref: ${{ needs.promote-image.outputs.image_tag }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -125,6 +170,15 @@ jobs:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Validate image URI
+        run: |
+          IMAGE_URI="${{ needs.promote-image.outputs.image_uri }}"
+          if [ -z "$IMAGE_URI" ]; then
+            echo "ERROR: image_uri is empty — aborting."
+            exit 1
+          fi
+          echo "Deploying: $IMAGE_URI"
 
       - name: Save current task definition (rollback target)
         id: rollback-target
@@ -135,7 +189,7 @@ jobs:
             --query "services[0].taskDefinition" \
             --output text)
           echo "task_def=$CURRENT" >> $GITHUB_OUTPUT
-          echo "Rollback target: $CURRENT"
+          echo "Rollback target saved: $CURRENT"
 
       - name: Download current task definition
         run: |
@@ -144,27 +198,13 @@ jobs:
             --query "taskDefinition" \
             > /tmp/prod-task-def.json
 
-      - name: Debug image URI
-        run: | 
-          echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
-
-      - name: Validate image URI
-        run: |
-          echo "Checking image URI..."
-          echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
-
-          if [ -z "${{ needs.build-production-image.outputs.image_uri }}" ]; then
-            echo "❌ ERROR: image_uri is empty"
-            exit 1
-          fi
-
       - name: Render updated task definition
         id: render-task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: /tmp/prod-task-def.json
           container-name:  app
-          image:           ${{ needs.build-production-image.outputs.image_uri }}
+          image:           ${{ needs.promote-image.outputs.image_uri }}
 
       - name: Deploy to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
@@ -174,15 +214,17 @@ jobs:
           cluster:                    ${{ secrets.ECS_CLUSTER_PROD }}
           wait-for-service-stability: false
 
-      - name: Wait for deployment to stabilize (5 min timeout)
+      - name: Wait for ECS to stabilize (10 min timeout)
         id: wait-stable
         run: |
-          if aws ecs wait services-stable \
+          if timeout 600 aws ecs wait services-stable \
               --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
               --services ${{ secrets.ECS_SERVICE_PROD }}; then
-            echo "stable=true" >> $GITHUB_OUTPUT
+            echo "stable=true"  >> $GITHUB_OUTPUT
+            echo "ECS service is stable."
           else
             echo "stable=false" >> $GITHUB_OUTPUT
+            echo "ECS service did NOT stabilize within 10 minutes."
           fi
 
       - name: Auto-rollback on failure
@@ -194,11 +236,13 @@ jobs:
             --service  ${{ secrets.ECS_SERVICE_PROD }} \
             --task-definition ${{ steps.rollback-target.outputs.task_def }} \
             --force-new-deployment
-          aws ecs wait services-stable \
+          echo "Waiting for rollback to stabilize..."
+          timeout 600 aws ecs wait services-stable \
             --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
-            --services ${{ secrets.ECS_SERVICE_PROD }}
+            --services ${{ secrets.ECS_SERVICE_PROD }} || true
+          echo "Rollback complete."
 
-      - name: Fail pipeline if rollback was triggered
+      - name: Fail pipeline after rollback
         if: steps.wait-stable.outputs.stable == 'false'
         run: exit 1
 
@@ -206,27 +250,31 @@ jobs:
         if: steps.wait-stable.outputs.stable == 'true'
         run: |
           ALB_DNS=$(aws elbv2 describe-load-balancers \
-            --names production-alb \
+            --names ${{ secrets.PROD_ALB_NAME }} \
             --query "LoadBalancers[0].DNSName" \
             --output text)
-          for i in {1..6}; do
+
+          echo "Checking http://$ALB_DNS/health/check ..."
+          for i in {1..10}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/health/check" || echo "000")
             if [ "$STATUS" = "200" ]; then
-              echo "Health check passed. Live at: http://$ALB_DNS"
+              echo "Health check passed on attempt $i."
+              echo "Live at: http://$ALB_DNS"
               exit 0
             fi
-            echo "Attempt $i: HTTP $STATUS, retrying in 10s..."
-            sleep 10
+            echo "Attempt $i: HTTP $STATUS — retrying in 15s..."
+            sleep 15
           done
-          echo "Warning: health check did not return 200 after 6 attempts."
+          echo "ERROR: Health check did not return 200 after 10 attempts."
+          exit 1
 
       - name: Deployment summary
         if: steps.wait-stable.outputs.stable == 'true'
         run: |
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  PRODUCTION DEPLOYMENT COMPLETE"
-          echo "  Image: ${{ needs.build-production-image.outputs.image_uri }}"
-          echo "  Tag:   ${{ needs.build-production-image.outputs.image_tag }}"
+          echo "  Image : ${{ needs.promote-image.outputs.image_uri }}"
+          echo "  Tag   : ${{ needs.promote-image.outputs.image_tag }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: Slack — production deploy succeeded
@@ -240,8 +288,8 @@ jobs:
                 "color": "good",
                 "fields": [
                   { "title": "Repo",  "value": "${{ github.repository }}", "short": true },
-                  { "title": "Tag",   "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
-                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                  { "title": "Tag",   "value": "${{ needs.promote-image.outputs.image_tag }}", "short": true },
+                  { "title": "Run",   "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
             }
@@ -260,9 +308,9 @@ jobs:
                 "color": "danger",
                 "fields": [
                   { "title": "Repo",           "value": "${{ github.repository }}", "short": true },
-                  { "title": "Failed tag",     "value": "${{ needs.build-production-image.outputs.image_tag }}", "short": true },
+                  { "title": "Failed tag",     "value": "${{ needs.promote-image.outputs.image_tag }}", "short": true },
                   { "title": "Rolled back to", "value": "${{ steps.rollback-target.outputs.task_def }}", "short": false },
-                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                  { "title": "Run",            "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
             }
