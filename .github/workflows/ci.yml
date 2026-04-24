@@ -1,11 +1,12 @@
 name: CI — Lint, Build, Deploy to Staging
 
-# Runs ONLY on pull_request to main.
+# Runs on pull_request to main AND on push to main (after merge).
 # Builds the image once, deploys to staging, saves the image tag
 # as an artifact so CD can promote the exact same image after merge.
-# No push-to-main trigger needed — CD reads the artifact from this run.
 on:
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
   workflow_dispatch:
 
