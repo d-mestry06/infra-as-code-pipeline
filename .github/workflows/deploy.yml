@@ -43,14 +43,11 @@ jobs:
           REGISTRY:     ${{ steps.login-ecr.outputs.registry }}
           STAGING_REPO: ${{ secrets.ECR_REPOSITORY_STAGING }}
           PROD_REPO:    ${{ secrets.ECR_REPOSITORY_PROD }}
-          INPUT_TAG:    ${{ github.event.inputs.image_tag }}
+          INPUT_TAG:    ${{ github.event.inputs.image_tag || github.sha }}
         run: |
-          # fallback logic
-          if [ -z "$INPUT_TAG" ]; then
-            TAG="latest"
-          else
-            TAG="$INPUT_TAG"
-          fi
+          
+          TAG="$INPUT_TAG"
+          
 
           STAGING_URI="$REGISTRY/$STAGING_REPO:$TAG"
           PROD_URI="$REGISTRY/$PROD_REPO:$TAG"
@@ -58,15 +55,18 @@ jobs:
           echo "Using TAG: $TAG"
           echo "Pulling: $STAGING_URI"
 
-          # fail fast if image not found
-          if docker pull "$STAGING_URI"; then
-            echo "Promoting image..."
-            docker tag "$STAGING_URI" "$PROD_URI"
-            docker push "$PROD_URI"
-          else
-            echo "❌ ERROR: Staging image not found"
-            exit 1
-          fi
+          echo "=============================="
+          echo "Using TAG: $TAG"
+          echo "Staging: $STAGING_URI"
+          echo "Production: $PROD_URI"
+          echo "=============================="
+
+          
+          docker pull "$STAGING_URI"
+          echo "Promoting image..."
+          docker tag "$STAGING_URI" "$PROD_URI"
+          docker push "$PROD_URI"
+         
 
           echo "image_uri=$PROD_URI" >> $GITHUB_OUTPUT
           echo "image_tag=$TAG" >> $GITHUB_OUTPUT
