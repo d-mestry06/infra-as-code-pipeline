@@ -1,34 +1,24 @@
-name: CD — Deploy to Production
+name: CD - Deploy to Production
 
-# Triggers after CI completes on main.
-# Downloads the image-tag artifact saved by CI during the PR run
-# to get the EXACT staging image SHA — no SHA mismatch possible.
+# Triggers after push to main (automatic after merge).
+# Waits for approval before deploying to production.
 on:
-  workflow_run:
-    workflows: ["CI — Lint, Build, Deploy to Staging"]
-    types: [completed]
+  push:
     branches: [main]
 
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag (SHA) to deploy — must exist in staging ECR"
+        description: "Image tag (SHA) to deploy - must exist in staging ECR"
         required: true
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
 
 jobs:
-  # ─────────────────────────────────────────────
-  # Job 1: Gate + resolve exact image tag
-  #
-  # Downloads the artifact saved by the CI run
-  # to get the exact SHA that was built & tested.
-  # This is the only correct way to get the staging
-  # image tag — avoids the merge-commit SHA mismatch.
-  # ─────────────────────────────────────────────
+  # Job 1: Resolve image tag
   resolve-image:
-    name: Resolve Image Tag from CI Artifact
+    name: Resolve Image Tag
     runs-on: ubuntu-latest
 
     outputs:
@@ -36,14 +26,15 @@ jobs:
       image_uri: ${{ steps.read.outputs.image_uri }}
 
     steps:
-      - name: Abort if CI did not succeed
-        if: >
-          github.event_name == 'workflow_run' &&
-          github.event.workflow_run.conclusion != 'success'
+      # On push to main: use the commit SHA directly
+      # (CI just built and pushed this SHA to staging ECR)
+      - name: Resolve image tag from push event
+        id: push
+        if: github.event_name == 'push'
         run: |
-          echo "CI conclusion: ${{ github.event.workflow_run.conclusion }}"
-          echo "Aborting — CD only runs after a successful CI."
-          exit 1
+          TAG="${{ github.sha }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Push event - using commit SHA as image tag: $TAG"
 
       # Manual dispatch: use the supplied tag directly
       - name: Use manually supplied image tag
@@ -56,37 +47,23 @@ jobs:
             exit 1
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "Manual deploy — tag: $TAG"
+          echo "Manual deploy - tag: $TAG"
 
-      # workflow_run: download the artifact the CI run uploaded
-      - name: Download staging-image-meta artifact from CI run
-        if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v4
-        with:
-          name: staging-image-meta
-          # Download from the specific CI workflow run that triggered this CD
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: /tmp/ci-artifact
-
-      - name: Read image tag from artifact
+      - name: Extract and validate image tag
         id: read
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${{ steps.push.outputs.tag }}"
+            echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+            echo "image_uri=" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ steps.manual.outputs.tag }}"
-            # For manual, reconstruct URI from known registry + staging repo
-            # (we configure AWS below to get the registry)
             echo "image_tag=$TAG" >> $GITHUB_OUTPUT
-            echo "image_uri=RESOLVE_BELOW" >> $GITHUB_OUTPUT
-          else
-            TAG=$(cat /tmp/ci-artifact/image-tag.txt | tr -d '[:space:]')
-            URI=$(cat /tmp/ci-artifact/image-uri.txt | tr -d '[:space:]')
-            echo "image_tag=$TAG" >> $GITHUB_OUTPUT
-            echo "image_uri=$URI" >> $GITHUB_OUTPUT
+            echo "image_uri=" >> $GITHUB_OUTPUT
           fi
           echo "=============================="
           echo "Resolved image_tag: $TAG"
-          echo "=============================="
+          echo "============================="
 
       - name: Validate tag was resolved
         run: |
@@ -96,10 +73,8 @@ jobs:
             exit 1
           fi
 
-  # ─────────────────────────────────────────────
-  # Job 2: Promote staging image → production ECR
+  # Job 2: Promote staging image to production ECR
   # Pure retag-and-push. Zero rebuild.
-  # ─────────────────────────────────────────────
   promote-image:
     name: Promote Staging Image to Production ECR
     runs-on: ubuntu-latest
@@ -141,7 +116,7 @@ jobs:
           # Pull the exact image that passed staging validation
           docker pull "$STAGING_URI"
 
-          # Retag and push to prod ECR — no rebuild, identical bits
+          # Retag and push to prod ECR - no rebuild, identical bits
           docker tag "$STAGING_URI" "$PROD_URI"
           docker tag "$STAGING_URI" "$PROD_LATEST"
           docker push "$PROD_URI"
@@ -162,12 +137,10 @@ jobs:
             exit 1
           fi
 
-  # ─────────────────────────────────────────────
   # Job 3: Manual approval gate
   # GitHub environment "production" must have a
   # required reviewer set in repo settings.
   # Forwards promote-image outputs to deploy job.
-  # ─────────────────────────────────────────────
   production-approval:
     name: Awaiting Production Approval
     runs-on: ubuntu-latest
@@ -185,11 +158,11 @@ jobs:
           echo "Image URI : ${{ needs.promote-image.outputs.image_uri }}"
           echo "Image tag : ${{ needs.promote-image.outputs.image_tag }}"
           if [ -z "${{ needs.promote-image.outputs.image_uri }}" ]; then
-            echo "ERROR: image_uri is empty — cannot proceed"
+            echo "ERROR: image_uri is empty - cannot proceed"
             exit 1
           fi
 
-      - name: Slack — production deploy starting
+      - name: Slack - production deploy starting
         uses: slackapi/slack-github-action@v1.27.0
         with:
           payload: |
@@ -209,9 +182,7 @@ jobs:
           SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
-  # ─────────────────────────────────────────────
   # Job 4: Deploy to production + auto-rollback
-  # ─────────────────────────────────────────────
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
@@ -243,7 +214,7 @@ jobs:
           fi
 
           if [ -z "$IMAGE_URI" ]; then
-            echo "ERROR: image_uri is empty — aborting deployment"
+            echo "ERROR: image_uri is empty - aborting deployment"
             exit 1
           fi
 
@@ -333,7 +304,7 @@ jobs:
               echo "Live at: http://$ALB_DNS"
               exit 0
             fi
-            echo "Attempt $i: HTTP $STATUS — retrying in 15s..."
+            echo "Attempt $i: HTTP $STATUS - retrying in 15s..."
             sleep 15
           done
           echo "ERROR: Health check did not return 200 after 10 attempts."
@@ -348,7 +319,7 @@ jobs:
           echo "  Tag   : ${{ steps.image.outputs.tag }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-      - name: Slack — production deploy succeeded
+      - name: Slack - production deploy succeeded
         if: steps.wait-stable.outputs.stable == 'true'
         uses: slackapi/slack-github-action@v1.27.0
         with:
@@ -368,13 +339,13 @@ jobs:
           SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
-      - name: Slack — production rolled back
+      - name: Slack - production rolled back
         if: steps.wait-stable.outputs.stable == 'false'
         uses: slackapi/slack-github-action@v1.27.0
         with:
           payload: |
             {
-              "text": ":warning: *Production deploy FAILED — auto-rollback triggered*",
+              "text": ":warning: *Production deploy FAILED - auto-rollback triggered*",
               "attachments": [{
                 "color": "danger",
                 "fields": [
