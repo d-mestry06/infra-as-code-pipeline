@@ -64,6 +64,7 @@ jobs:
 
     outputs:
       image_uri: ${{ steps.build-push.outputs.image_uri }}
+      image_tag: ${{ github.sha }}
 
     steps:
       - name: Checkout code
@@ -89,7 +90,10 @@ jobs:
           IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
           docker build --build-arg APP_VERSION="$IMAGE_TAG" -t "$IMAGE_URI" app/
+          docker tag "$IMAGE_URI" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
           docker push "$IMAGE_URI"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
           echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
           echo "Built and pushed: $IMAGE_URI"

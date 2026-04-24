@@ -40,29 +40,36 @@ jobs:
       - name: Promote staging image to production ECR
         id: promote
         env:
-          REGISTRY:    ${{ steps.login-ecr.outputs.registry }}
+          REGISTRY:     ${{ steps.login-ecr.outputs.registry }}
           STAGING_REPO: ${{ secrets.ECR_REPOSITORY_STAGING }}
           PROD_REPO:    ${{ secrets.ECR_REPOSITORY_PROD }}
           INPUT_TAG:    ${{ github.event.inputs.image_tag }}
         run: |
+          # fallback logic
           if [ -z "$INPUT_TAG" ]; then
-            TAG="latest"   # quick fix (since your staging has only latest)
+            TAG="latest"
           else
             TAG="$INPUT_TAG"
           fi
-          echo "Using TAG: $TAG"
-          echo "Staging URI: $REGISTRY/$STAGING_REPO:$TAG"
-          echo "Production URI: $REGISTRY/$PROD_REPO:$TAG"
+
           STAGING_URI="$REGISTRY/$STAGING_REPO:$TAG"
           PROD_URI="$REGISTRY/$PROD_REPO:$TAG"
 
-          docker pull "$STAGING_URI"
-          docker tag  "$STAGING_URI" "$PROD_URI"
-          docker push "$PROD_URI"
+          echo "Using TAG: $TAG"
+          echo "Pulling: $STAGING_URI"
+
+          # fail fast if image not found
+          if docker pull "$STAGING_URI"; then
+            echo "Promoting image..."
+            docker tag "$STAGING_URI" "$PROD_URI"
+            docker push "$PROD_URI"
+          else
+            echo "❌ ERROR: Staging image not found"
+            exit 1
+          fi
 
           echo "image_uri=$PROD_URI" >> $GITHUB_OUTPUT
-          echo "image_tag=$TAG"      >> $GITHUB_OUTPUT
-          echo "Promoted: $STAGING_URI → $PROD_URI"
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
 
   # ─────────────────────────────────────────────
   # Job 2: Manual approval gate
@@ -140,6 +147,16 @@ jobs:
       - name: Debug image URI
         run: | 
           echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
+
+      - name: Validate image URI
+        run: |
+          echo "Checking image URI..."
+          echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
+
+          if [ -z "${{ needs.build-production-image.outputs.image_uri }}" ]; then
+            echo "❌ ERROR: image_uri is empty"
+            exit 1
+          fi
 
       - name: Render updated task definition
         id: render-task-def
