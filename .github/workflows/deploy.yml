@@ -1,9 +1,11 @@
 name: CD - Deploy to Production
 
-# Triggers after push to main (automatic after merge).
-# Waits for approval before deploying to production.
+# Triggers AFTER CI completes successfully on main branch.
+# This ensures the image is already built and pushed to staging ECR.
 on:
-  push:
+  workflow_run:
+    workflows: ["CI - Lint, Build, Deploy to Staging"]
+    types: [completed]
     branches: [main]
 
   workflow_dispatch:
