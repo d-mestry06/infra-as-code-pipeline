@@ -1,35 +1,39 @@
 name: CD — Deploy to Production
 
-# Triggers only after CI completes successfully on a merge to main.
-# This guarantees the staging ECR image (built during the PR) exists
-# before we attempt to promote it — no rebuild, pure artifact promotion.
+# Triggers after CI completes on main.
+# Downloads the image-tag artifact saved by CI during the PR run
+# to get the EXACT staging image SHA — no SHA mismatch possible.
 on:
   workflow_run:
     workflows: ["CI — Lint, Build, Deploy to Staging"]
     types: [completed]
     branches: [main]
 
-  # Allow manual deploys with an optional image tag override
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Docker image tag to deploy (leave blank to use latest main SHA)"
-        required: false
-        default: ""
+        description: "Image tag (SHA) to deploy — must exist in staging ECR"
+        required: true
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
 
 jobs:
   # ─────────────────────────────────────────────
-  # Job 1: Gate — abort if upstream CI failed
+  # Job 1: Gate + resolve exact image tag
+  #
+  # Downloads the artifact saved by the CI run
+  # to get the exact SHA that was built & tested.
+  # This is the only correct way to get the staging
+  # image tag — avoids the merge-commit SHA mismatch.
   # ─────────────────────────────────────────────
-  check-ci-status:
-    name: Check CI Status
+  resolve-image:
+    name: Resolve Image Tag from CI Artifact
     runs-on: ubuntu-latest
 
     outputs:
-      sha: ${{ steps.resolve.outputs.sha }}
+      image_tag: ${{ steps.read.outputs.image_tag }}
+      image_uri: ${{ steps.read.outputs.image_uri }}
 
     steps:
       - name: Abort if CI did not succeed
@@ -37,33 +41,69 @@ jobs:
           github.event_name == 'workflow_run' &&
           github.event.workflow_run.conclusion != 'success'
         run: |
-          echo "Upstream CI conclusion: ${{ github.event.workflow_run.conclusion }}"
-          echo "Aborting CD — only deploying after a successful CI run."
+          echo "CI conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "Aborting — CD only runs after a successful CI."
           exit 1
 
-      - name: Resolve image tag (SHA)
-        id: resolve
+      # Manual dispatch: use the supplied tag directly
+      - name: Use manually supplied image tag
+        id: manual
+        if: github.event_name == 'workflow_dispatch'
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.image_tag }}" ]; then
-            # Manual override
-            SHA="${{ github.event.inputs.image_tag }}"
-          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
-            # SHA of the HEAD commit that triggered CI (the PR merge commit)
-            SHA="${{ github.event.workflow_run.head_sha }}"
-          else
-            SHA="${{ github.sha }}"
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            echo "ERROR: image_tag input is required for manual dispatch"
+            exit 1
           fi
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "Resolved image tag (SHA): $SHA"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Manual deploy — tag: $TAG"
+
+      # workflow_run: download the artifact the CI run uploaded
+      - name: Download staging-image-meta artifact from CI run
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: staging-image-meta
+          # Download from the specific CI workflow run that triggered this CD
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: /tmp/ci-artifact
+
+      - name: Read image tag from artifact
+        id: read
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ steps.manual.outputs.tag }}"
+            # For manual, reconstruct URI from known registry + staging repo
+            # (we configure AWS below to get the registry)
+            echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+            echo "image_uri=RESOLVE_BELOW" >> $GITHUB_OUTPUT
+          else
+            TAG=$(cat /tmp/ci-artifact/image-tag.txt | tr -d '[:space:]')
+            URI=$(cat /tmp/ci-artifact/image-uri.txt | tr -d '[:space:]')
+            echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+            echo "image_uri=$URI" >> $GITHUB_OUTPUT
+          fi
+          echo "=============================="
+          echo "Resolved image_tag: $TAG"
+          echo "=============================="
+
+      - name: Validate tag was resolved
+        run: |
+          TAG="${{ steps.read.outputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            echo "ERROR: image_tag could not be resolved"
+            exit 1
+          fi
 
   # ─────────────────────────────────────────────
   # Job 2: Promote staging image → production ECR
-  # Pure tag-and-push, zero rebuild.
+  # Pure retag-and-push. Zero rebuild.
   # ─────────────────────────────────────────────
   promote-image:
-    name: Promote Staging Image to Production
+    name: Promote Staging Image to Production ECR
     runs-on: ubuntu-latest
-    needs: check-ci-status
+    needs: resolve-image
 
     outputs:
       image_uri: ${{ steps.promote.outputs.image_uri }}
@@ -87,21 +127,21 @@ jobs:
           REGISTRY:     ${{ steps.login-ecr.outputs.registry }}
           STAGING_REPO: ${{ secrets.ECR_REPOSITORY_STAGING }}
           PROD_REPO:    ${{ secrets.ECR_REPOSITORY_PROD }}
-          TAG:          ${{ needs.check-ci-status.outputs.sha }}
+          TAG:          ${{ needs.resolve-image.outputs.image_tag }}
         run: |
           STAGING_URI="$REGISTRY/$STAGING_REPO:$TAG"
           PROD_URI="$REGISTRY/$PROD_REPO:$TAG"
           PROD_LATEST="$REGISTRY/$PROD_REPO:latest"
 
           echo "=============================="
-          echo "Promoting: $STAGING_URI"
-          echo "       To: $PROD_URI"
+          echo "Staging image : $STAGING_URI"
+          echo "Prod target   : $PROD_URI"
           echo "=============================="
 
-          # Pull the exact image that was tested in staging
+          # Pull the exact image that passed staging validation
           docker pull "$STAGING_URI"
 
-          # Retag for prod repo and push both SHA and :latest
+          # Retag and push to prod ECR — no rebuild, identical bits
           docker tag "$STAGING_URI" "$PROD_URI"
           docker tag "$STAGING_URI" "$PROD_LATEST"
           docker push "$PROD_URI"
@@ -111,10 +151,22 @@ jobs:
           echo "image_tag=$TAG"      >> $GITHUB_OUTPUT
           echo "Promotion complete."
 
+      - name: Verify outputs
+        run: |
+          URI="${{ steps.promote.outputs.image_uri }}"
+          TAG="${{ steps.promote.outputs.image_tag }}"
+          echo "image_uri: $URI"
+          echo "image_tag: $TAG"
+          if [ -z "$URI" ] || [ -z "$TAG" ]; then
+            echo "ERROR: promote outputs not set"
+            exit 1
+          fi
+
   # ─────────────────────────────────────────────
   # Job 3: Manual approval gate
-  # Requires a GitHub environment named "production"
-  # with a required reviewer configured in repo settings.
+  # GitHub environment "production" must have a
+  # required reviewer set in repo settings.
+  # Forwards promote-image outputs to deploy job.
   # ─────────────────────────────────────────────
   production-approval:
     name: Awaiting Production Approval
@@ -122,19 +174,27 @@ jobs:
     needs: promote-image
     environment: production
 
+    outputs:
+      image_uri: ${{ needs.promote-image.outputs.image_uri }}
+      image_tag: ${{ needs.promote-image.outputs.image_tag }}
+
     steps:
-      - name: Approval granted
+      - name: Confirm approved image
         run: |
-          echo "Production deployment approved."
-          echo "Image : ${{ needs.promote-image.outputs.image_uri }}"
-          echo "Tag   : ${{ needs.promote-image.outputs.image_tag }}"
+          echo "Approved for production deployment."
+          echo "Image URI : ${{ needs.promote-image.outputs.image_uri }}"
+          echo "Image tag : ${{ needs.promote-image.outputs.image_tag }}"
+          if [ -z "${{ needs.promote-image.outputs.image_uri }}" ]; then
+            echo "ERROR: image_uri is empty — cannot proceed"
+            exit 1
+          fi
 
       - name: Slack — production deploy starting
         uses: slackapi/slack-github-action@v1.27.0
         with:
           payload: |
             {
-              "text": ":rocket: *Production deploy starting*",
+              "text": ":rocket: *Production deploy approved and starting*",
               "attachments": [{
                 "color": "#0066cc",
                 "fields": [
@@ -160,9 +220,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          # Checkout the exact commit that was built and tested
-          ref: ${{ needs.promote-image.outputs.image_tag }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -171,13 +228,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      - name: Validate image URI
+      - name: Resolve image URI
+        id: image
         run: |
+          # Primary: direct from promote-image
           IMAGE_URI="${{ needs.promote-image.outputs.image_uri }}"
+          IMAGE_TAG="${{ needs.promote-image.outputs.image_tag }}"
+
+          # Fallback: forwarded through production-approval
           if [ -z "$IMAGE_URI" ]; then
-            echo "ERROR: image_uri is empty — aborting."
+            IMAGE_URI="${{ needs.production-approval.outputs.image_uri }}"
+            IMAGE_TAG="${{ needs.production-approval.outputs.image_tag }}"
+            echo "Used forwarded outputs from production-approval"
+          fi
+
+          if [ -z "$IMAGE_URI" ]; then
+            echo "ERROR: image_uri is empty — aborting deployment"
             exit 1
           fi
+
+          echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Deploying: $IMAGE_URI"
 
       - name: Save current task definition (rollback target)
@@ -189,7 +260,7 @@ jobs:
             --query "services[0].taskDefinition" \
             --output text)
           echo "task_def=$CURRENT" >> $GITHUB_OUTPUT
-          echo "Rollback target saved: $CURRENT"
+          echo "Rollback target: $CURRENT"
 
       - name: Download current task definition
         run: |
@@ -204,7 +275,7 @@ jobs:
         with:
           task-definition: /tmp/prod-task-def.json
           container-name:  app
-          image:           ${{ needs.promote-image.outputs.image_uri }}
+          image:           ${{ steps.image.outputs.uri }}
 
       - name: Deploy to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
@@ -273,8 +344,8 @@ jobs:
         run: |
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  PRODUCTION DEPLOYMENT COMPLETE"
-          echo "  Image : ${{ needs.promote-image.outputs.image_uri }}"
-          echo "  Tag   : ${{ needs.promote-image.outputs.image_tag }}"
+          echo "  Image : ${{ steps.image.outputs.uri }}"
+          echo "  Tag   : ${{ steps.image.outputs.tag }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: Slack — production deploy succeeded
@@ -288,7 +359,7 @@ jobs:
                 "color": "good",
                 "fields": [
                   { "title": "Repo",  "value": "${{ github.repository }}", "short": true },
-                  { "title": "Tag",   "value": "${{ needs.promote-image.outputs.image_tag }}", "short": true },
+                  { "title": "Tag",   "value": "${{ steps.image.outputs.tag }}", "short": true },
                   { "title": "Run",   "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
@@ -308,7 +379,7 @@ jobs:
                 "color": "danger",
                 "fields": [
                   { "title": "Repo",           "value": "${{ github.repository }}", "short": true },
-                  { "title": "Failed tag",     "value": "${{ needs.promote-image.outputs.image_tag }}", "short": true },
+                  { "title": "Failed tag",     "value": "${{ steps.image.outputs.tag }}", "short": true },
                   { "title": "Rolled back to", "value": "${{ steps.rollback-target.outputs.task_def }}", "short": false },
                   { "title": "Run",            "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]

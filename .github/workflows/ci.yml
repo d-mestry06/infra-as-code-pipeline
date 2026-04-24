@@ -1,12 +1,11 @@
 name: CI — Lint, Build, Deploy to Staging
 
-# On pull_request: lint + build + deploy to staging (full pipeline)
-# On push to main:  build + push ONLY (tags the merge commit SHA so CD can promote it)
-#                   staging deploy is skipped — it was already done during the PR run
+# Runs ONLY on pull_request to main.
+# Builds the image once, deploys to staging, saves the image tag
+# as an artifact so CD can promote the exact same image after merge.
+# No push-to-main trigger needed — CD reads the artifact from this run.
 on:
   pull_request:
-    branches: [main]
-  push:
     branches: [main]
   workflow_dispatch:
 
@@ -21,12 +20,10 @@ permissions:
 jobs:
   # ─────────────────────────────────────────────
   # Job 1: Terraform Lint & Validate
-  # Skipped on push to main (already passed on PR)
   # ─────────────────────────────────────────────
   terraform-lint:
     name: Terraform Lint & Validate
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout code
@@ -63,19 +60,15 @@ jobs:
 
   # ─────────────────────────────────────────────
   # Job 2: Docker Build & Push to Staging ECR
-  # Runs on BOTH pull_request and push to main.
-  # On push to main: github.sha = merge commit SHA
-  # CD uses workflow_run.head_sha which equals that
-  # merge commit SHA — so the tags always match.
+  #
+  # IMAGE_TAG = github.sha (PR branch HEAD commit)
+  # This tag is saved as a workflow artifact so CD
+  # can look it up after merge without a SHA mismatch.
   # ─────────────────────────────────────────────
   docker-build-push:
     name: Docker Build & Push
     runs-on: ubuntu-latest
-    needs: [terraform-lint]
-    if: |
-      always() &&
-      (needs.terraform-lint.result == 'success' ||
-       needs.terraform-lint.result == 'skipped')
+    needs: terraform-lint
 
     outputs:
       image_uri: ${{ steps.build-push.outputs.image_uri }}
@@ -115,16 +108,33 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Built and pushed: $IMAGE_URI"
 
+      # Save the image tag to a file artifact so CD can retrieve
+      # the exact SHA that was built and tested, regardless of merge commit SHA.
+      - name: Save image tag artifact
+        run: |
+          mkdir -p /tmp/ci-artifact
+          echo "${{ github.sha }}" > /tmp/ci-artifact/image-tag.txt
+          echo "${{ steps.build-push.outputs.image_uri }}" > /tmp/ci-artifact/image-uri.txt
+          echo "Saved artifact:"
+          cat /tmp/ci-artifact/image-tag.txt
+          cat /tmp/ci-artifact/image-uri.txt
+
+      - name: Upload image tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-image-meta
+          path: /tmp/ci-artifact/
+          # Retain for 7 days — enough time for PR review + merge + CD run
+          retention-days: 7
+
   # ─────────────────────────────────────────────
   # Job 3: Deploy to Staging
-  # Only on pull_request — skipped on push to main
   # ─────────────────────────────────────────────
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     needs: docker-build-push
     environment: staging
-    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout code
@@ -184,13 +194,14 @@ jobs:
               echo "Health check passed (attempt $i)"
               exit 0
             fi
-            echo "Attempt $i: got $STATUS, retrying in 15s..."
+            echo "Attempt $i: got $STATUS — retrying in 15s..."
             sleep 15
           done
           echo "ERROR: Health check failed after 10 attempts."
           exit 1
 
       - name: Post staging URL to PR
+        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         env:
           AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
@@ -207,12 +218,12 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: [
-                '## Staging Deployment Successful',
+                '## ✅ Staging Deployment Successful',
                 '',
                 `**URL:** http://${dns}`,
-                `**Image:** \`${{ github.sha }}\``,
+                `**Image tag:** \`${{ github.sha }}\``,
                 '',
-                'Healthy and ready for review.',
+                '_This exact image will be promoted to production after merge._',
               ].join('\n'),
             });
 
@@ -228,9 +239,9 @@ jobs:
                 "fields": [
                   { "title": "Repo",   "value": "${{ github.repository }}", "short": true },
                   { "title": "Branch", "value": "${{ github.head_ref }}",   "short": true },
-                  { "title": "Commit", "value": "${{ github.sha }}",        "short": true },
+                  { "title": "Tag",    "value": "${{ github.sha }}",        "short": true },
                   { "title": "Actor",  "value": "${{ github.actor }}",      "short": true },
-                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                  { "title": "Run",    "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
             }
@@ -250,9 +261,9 @@ jobs:
                 "fields": [
                   { "title": "Repo",   "value": "${{ github.repository }}", "short": true },
                   { "title": "Branch", "value": "${{ github.head_ref }}",   "short": true },
-                  { "title": "Commit", "value": "${{ github.sha }}",        "short": true },
+                  { "title": "Tag",    "value": "${{ github.sha }}",        "short": true },
                   { "title": "Actor",  "value": "${{ github.actor }}",      "short": true },
-                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
+                  { "title": "Run",    "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>", "short": false }
                 ]
               }]
             }
