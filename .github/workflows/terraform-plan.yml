@@ -11,7 +11,7 @@ env:
 
 jobs:
   terraform-plan:
-    name: Terraform Plan — Staging
+    name: Terraform Plan - Staging
     runs-on: ubuntu-latest
 
     permissions:
@@ -58,7 +58,7 @@ jobs:
               ? plan.substring(0, maxLen) + '\n\n... (truncated)'
               : plan;
 
-            const body = `## Terraform Plan — Staging
+            const body = `## Terraform Plan - Staging
 
             <details><summary>Show Plan Output</summary>
 
@@ -68,7 +68,7 @@ jobs:
 
             </details>
 
-            **Status:** ${{ steps.plan.outputs.exitcode == '0' && '✅ Plan succeeded' || '❌ Plan failed — check output' }}
+            **Status:** ${{ steps.plan.outputs.exitcode == '0' && '✅ Plan succeeded' || '❌ Plan failed - check output' }}
             `;
 
             github.rest.issues.createComment({

@@ -1,4 +1,4 @@
-name: CI — Lint, Build, Deploy to Staging
+name: CI - Lint, Build, Deploy to Staging
 
 # Runs on pull_request to main AND on push to main (after merge).
 # Builds the image once, deploys to staging, saves the image tag
@@ -19,9 +19,7 @@ permissions:
   contents: read
 
 jobs:
-  # ─────────────────────────────────────────────
   # Job 1: Terraform Lint & Validate
-  # ─────────────────────────────────────────────
   terraform-lint:
     name: Terraform Lint & Validate
     runs-on: ubuntu-latest
@@ -59,13 +57,10 @@ jobs:
         working-directory: terraform/environments/staging
         run: tflint --format compact
 
-  # ─────────────────────────────────────────────
   # Job 2: Docker Build & Push to Staging ECR
-  #
   # IMAGE_TAG = github.sha (PR branch HEAD commit)
   # This tag is saved as a workflow artifact so CD
   # can look it up after merge without a SHA mismatch.
-  # ─────────────────────────────────────────────
   docker-build-push:
     name: Docker Build & Push
     runs-on: ubuntu-latest
@@ -125,12 +120,10 @@ jobs:
         with:
           name: staging-image-meta
           path: /tmp/ci-artifact/
-          # Retain for 7 days — enough time for PR review + merge + CD run
+          # Retain for 7 days - enough time for PR review + merge + CD run
           retention-days: 7
 
-  # ─────────────────────────────────────────────
   # Job 3: Deploy to Staging
-  # ─────────────────────────────────────────────
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
@@ -195,7 +188,7 @@ jobs:
               echo "Health check passed (attempt $i)"
               exit 0
             fi
-            echo "Attempt $i: got $STATUS — retrying in 15s..."
+            echo "Attempt $i: got $STATUS - retrying in 15s..."
             sleep 15
           done
           echo "ERROR: Health check failed after 10 attempts."
@@ -228,7 +221,7 @@ jobs:
               ].join('\n'),
             });
 
-      - name: Slack — staging deploy success
+      - name: Slack - staging deploy success
         if: success()
         uses: slackapi/slack-github-action@v1.27.0
         with:
@@ -250,7 +243,7 @@ jobs:
           SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
-      - name: Slack — staging deploy failed
+      - name: Slack - staging deploy failed
         if: failure()
         uses: slackapi/slack-github-action@v1.27.0
         with:
