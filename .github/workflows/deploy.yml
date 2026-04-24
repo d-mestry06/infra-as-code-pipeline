@@ -45,7 +45,14 @@ jobs:
           PROD_REPO:    ${{ secrets.ECR_REPOSITORY_PROD }}
           INPUT_TAG:    ${{ github.event.inputs.image_tag }}
         run: |
-          TAG="${INPUT_TAG:-${{ github.sha }}}"
+          if [ -z "$INPUT_TAG" ]; then
+            TAG="latest"   # quick fix (since your staging has only latest)
+          else
+            TAG="$INPUT_TAG"
+          fi
+          echo "Using TAG: $TAG"
+          echo "Staging URI: $REGISTRY/$STAGING_REPO:$TAG"
+          echo "Production URI: $REGISTRY/$PROD_REPO:$TAG"
           STAGING_URI="$REGISTRY/$STAGING_REPO:$TAG"
           PROD_URI="$REGISTRY/$PROD_REPO:$TAG"
 
@@ -126,9 +133,13 @@ jobs:
       - name: Download current task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition ${{ secrets.ECS_SERVICE_PROD }} \
+            --task-definition ${{ steps.rollback-target.outputs.task_def }} \
             --query "taskDefinition" \
             > /tmp/prod-task-def.json
+
+      - name: Debug image URI
+        run: | 
+          echo "Image: ${{ needs.build-production-image.outputs.image_uri }}"
 
       - name: Render updated task definition
         id: render-task-def
