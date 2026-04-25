@@ -298,7 +298,7 @@ const server = http.createServer((req, res) => {
 
     <div class="hero">
         <div class="hero-eyebrow">ECS Fargate · GitHub Actions · Terraform</div>
-        <h1>Ship faster with<br><em>zero-touch deployments</em></h1>
+        <h1>Deploy faster. No hands needed.<br><em>zero-touch deployments</em></h1>
         <p class="hero-sub">Fully automated CI/CD pipeline. Code flows from PR to production with health-check validation and automatic rollback in under 60 seconds.</p>
         <div class="hero-actions">
             <a href="/health" class="btn btn-primary">🟢 System Status</a>
