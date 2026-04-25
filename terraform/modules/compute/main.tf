@@ -110,7 +110,7 @@ resource "aws_lb" "main" {
   security_groups    = [var.alb_security_group_id]
   subnets            = var.public_subnet_ids
 
-  enable_deletion_protection =  false
+  enable_deletion_protection = false
   drop_invalid_header_fields = true
 
   access_logs {
