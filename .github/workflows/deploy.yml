@@ -1,9 +1,10 @@
 name: CD - Deploy to Production
 
-# Triggers AFTER CI completes on main (i.e. after PR merge).
-# Downloads the staging-image-meta artifact uploaded by CI
-# to get the EXACT image SHA that was built and tested in staging.
-# This is the only correct way — no SHA mismatch, no rebuild ever.
+# Triggers after CI completes on main branch.
+# CI runs on push to main (after PR merge) and tags the image
+# with the merge commit SHA — that same SHA is what we promote here.
+# workflow_run branches:[main] matches correctly because CI's
+# push-to-main run has head_branch = main.
 on:
   workflow_run:
     workflows: ["CI - Lint, Build, Deploy to Staging"]
@@ -13,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag (SHA) to deploy - must already exist in staging ECR"
+        description: "Image tag (SHA) to deploy - must exist in staging ECR"
         required: true
 
 env:
@@ -21,13 +22,10 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────
-  # Job 1: Resolve the exact image tag
-  #
-  # workflow_run path: downloads the artifact saved
-  #   by CI during the PR to read image-tag.txt —
-  #   this is the PR branch SHA, NOT the merge commit.
-  #
-  # workflow_dispatch path: uses the manually supplied tag.
+  # Job 1: Gate — abort if CI failed
+  # Resolves the merge commit SHA to use for this deploy.
+  # workflow_run.head_sha = merge commit SHA = what CI
+  # just built and pushed to staging ECR.
   # ─────────────────────────────────────────────
   resolve-image:
     name: Resolve Image Tag
@@ -35,7 +33,6 @@ jobs:
 
     outputs:
       image_tag: ${{ steps.resolve.outputs.image_tag }}
-      image_uri: ${{ steps.resolve.outputs.image_uri }}
 
     steps:
       - name: Abort if CI did not succeed
@@ -44,58 +41,32 @@ jobs:
           github.event.workflow_run.conclusion != 'success'
         run: |
           echo "CI conclusion: ${{ github.event.workflow_run.conclusion }}"
-          echo "Aborting CD — only runs after a successful CI."
+          echo "Aborting — CD only runs after a successful CI."
           exit 1
 
-      # Download the artifact that CI uploaded during the PR run.
-      # run-id points to the specific CI run that triggered this CD.
-      - name: Download staging-image-meta artifact from CI run
-        if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v4
-        with:
-          name: staging-image-meta
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: /tmp/ci-artifact
-
-      - name: Resolve image tag and URI
+      - name: Resolve image tag
         id: resolve
         run: |
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            # Read from artifact — this is the PR branch SHA, guaranteed correct
-            IMAGE_TAG=$(cat /tmp/ci-artifact/image-tag.txt | tr -d '[:space:]')
-            IMAGE_URI=$(cat /tmp/ci-artifact/image-uri.txt | tr -d '[:space:]')
-
-            if [ -z "$IMAGE_TAG" ]; then
-              echo "ERROR: image-tag.txt is empty — artifact may be corrupt"
-              exit 1
-            fi
-            if [ -z "$IMAGE_URI" ]; then
-              echo "ERROR: image-uri.txt is empty — artifact may be corrupt"
-              exit 1
-            fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.image_tag }}"
           else
-            # Manual dispatch — tag supplied by user, URI resolved after ECR login in next job
-            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
-            IMAGE_URI=""
-            if [ -z "$IMAGE_TAG" ]; then
-              echo "ERROR: image_tag input is required for manual dispatch"
-              exit 1
-            fi
+            # workflow_run: head_sha is the merge commit SHA
+            # CI built and pushed this exact SHA to staging ECR
+            TAG="${{ github.event.workflow_run.head_sha }}"
           fi
 
-          echo "=============================="
-          echo "image_tag : $IMAGE_TAG"
-          echo "image_uri : $IMAGE_URI"
-          echo "=============================="
+          if [ -z "$TAG" ]; then
+            echo "ERROR: could not resolve image tag"
+            exit 1
+          fi
 
-          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Resolved image tag: $TAG"
 
   # ─────────────────────────────────────────────
   # Job 2: Promote staging image → production ECR
   # Pure retag-and-push. Zero rebuild.
-  # The exact image that ran in staging goes to prod.
+  # The exact image built on push-to-main goes to prod.
   # ─────────────────────────────────────────────
   promote-image:
     name: Promote Staging Image to Production ECR
@@ -135,7 +106,7 @@ jobs:
           echo "Pushing  : $PROD_URI"
           echo "=============================="
 
-          # Pull the exact image that was deployed and verified in staging
+          # Pull the exact image built and verified on push-to-main
           docker pull "$STAGING_URI"
 
           # Retag for prod repo — identical bits, zero rebuild
@@ -161,8 +132,8 @@ jobs:
 
   # ─────────────────────────────────────────────
   # Job 3: Manual approval gate
-  # Requires GitHub environment "production" to have
-  # a required reviewer configured in repo Settings.
+  # Requires GitHub environment "production" with
+  # a required reviewer in repo Settings → Environments.
   # Forwards outputs so deploy-production can read them.
   # ─────────────────────────────────────────────
   production-approval:
@@ -228,11 +199,9 @@ jobs:
       - name: Resolve image URI
         id: image
         run: |
-          # Try promote-image outputs directly first
           IMAGE_URI="${{ needs.promote-image.outputs.image_uri }}"
           IMAGE_TAG="${{ needs.promote-image.outputs.image_tag }}"
 
-          # Fallback: forwarded through production-approval
           if [ -z "$IMAGE_URI" ]; then
             IMAGE_URI="${{ needs.production-approval.outputs.image_uri }}"
             IMAGE_TAG="${{ needs.production-approval.outputs.image_tag }}"

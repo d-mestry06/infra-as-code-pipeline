@@ -1,10 +1,12 @@
 name: CI - Lint, Build, Deploy to Staging
 
-# Runs ONLY on pull_request to main.
-# Builds once, deploys to staging, uploads image metadata
-# as an artifact — CD downloads it after merge to get the exact SHA.
+# pull_request → full pipeline: lint + build + staging deploy
+# push to main  → build + push only (tags merge commit SHA for CD to promote)
+#                 staging deploy skipped — already done during PR
 on:
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
   workflow_dispatch:
 
@@ -19,10 +21,12 @@ permissions:
 jobs:
   # ─────────────────────────────────────────────
   # Job 1: Terraform Lint & Validate
+  # Skipped on push to main — already passed on PR
   # ─────────────────────────────────────────────
   terraform-lint:
     name: Terraform Lint & Validate
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout code
@@ -60,15 +64,23 @@ jobs:
   # ─────────────────────────────────────────────
   # Job 2: Docker Build & Push to Staging ECR
   #
-  # Tags the image with github.sha (PR branch HEAD).
-  # Saves image-tag.txt + image-uri.txt as an artifact
-  # so CD can download it after merge and get the
-  # exact SHA — no SHA mismatch, no rebuild ever.
+  # Runs on BOTH pull_request and push to main.
+  #
+  # On pull_request : github.sha = PR branch HEAD
+  #                   image deployed to staging for review
+  #
+  # On push to main : github.sha = merge commit SHA
+  #                   this is the SHA CD will use to promote
+  #                   workflow_run branches:[main] matches correctly
   # ─────────────────────────────────────────────
   docker-build-push:
     name: Docker Build & Push
     runs-on: ubuntu-latest
-    needs: terraform-lint
+    needs: [terraform-lint]
+    if: |
+      always() &&
+      (needs.terraform-lint.result == 'success' ||
+       needs.terraform-lint.result == 'skipped')
 
     outputs:
       image_uri: ${{ steps.build-push.outputs.image_uri }}
@@ -108,31 +120,17 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Built and pushed: $IMAGE_URI"
 
-      - name: Save image metadata artifact
-        run: |
-          mkdir -p /tmp/ci-artifact
-          # CD will download these files to get the exact staging image SHA
-          echo "${{ github.sha }}"                              > /tmp/ci-artifact/image-tag.txt
-          echo "${{ steps.build-push.outputs.image_uri }}"     > /tmp/ci-artifact/image-uri.txt
-          echo "Artifact contents:"
-          cat /tmp/ci-artifact/image-tag.txt
-          cat /tmp/ci-artifact/image-uri.txt
-
-      - name: Upload image metadata artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: staging-image-meta
-          path: /tmp/ci-artifact/
-          retention-days: 7
-
   # ─────────────────────────────────────────────
   # Job 3: Deploy to Staging
+  # Only on pull_request — skipped on push to main
+  # (staging was already validated during the PR run)
   # ─────────────────────────────────────────────
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     needs: docker-build-push
     environment: staging
+    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout code
