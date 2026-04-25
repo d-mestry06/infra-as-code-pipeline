@@ -1,10 +1,5 @@
 name: CD - Deploy to Production
 
-# Triggers after CI completes on main branch.
-# CI runs on push to main (after PR merge) and tags the image
-# with the merge commit SHA — that same SHA is what we promote here.
-# workflow_run branches:[main] matches correctly because CI's
-# push-to-main run has head_branch = main.
 on:
   workflow_run:
     workflows: ["CI - Lint, Build, Deploy to Staging"]
@@ -23,9 +18,11 @@ env:
 jobs:
   # ─────────────────────────────────────────────
   # Job 1: Gate — abort if CI failed
-  # Resolves the merge commit SHA to use for this deploy.
-  # workflow_run.head_sha = merge commit SHA = what CI
-  # just built and pushed to staging ECR.
+  # Resolves and outputs ONLY the image tag (SHA).
+  # The URI is intentionally NOT passed as a job output
+  # because GitHub drops outputs across environment gates.
+  # Every downstream job reconstructs the URI from
+  # secrets + tag — always available, never dropped.
   # ─────────────────────────────────────────────
   resolve-image:
     name: Resolve Image Tag
@@ -50,8 +47,6 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.image_tag }}"
           else
-            # workflow_run: head_sha is the merge commit SHA
-            # CI built and pushed this exact SHA to staging ECR
             TAG="${{ github.event.workflow_run.head_sha }}"
           fi
 
@@ -65,8 +60,9 @@ jobs:
 
   # ─────────────────────────────────────────────
   # Job 2: Promote staging image → production ECR
-  # Pure retag-and-push. Zero rebuild.
-  # The exact image built on push-to-main goes to prod.
+  # Reconstructs full URIs from secrets + tag.
+  # Outputs ONLY image_tag — URI reconstructed in
+  # deploy job to avoid environment gate output drop.
   # ─────────────────────────────────────────────
   promote-image:
     name: Promote Staging Image to Production ECR
@@ -74,7 +70,6 @@ jobs:
     needs: resolve-image
 
     outputs:
-      image_uri: ${{ steps.promote.outputs.image_uri }}
       image_tag: ${{ steps.promote.outputs.image_tag }}
 
     steps:
@@ -106,35 +101,31 @@ jobs:
           echo "Pushing  : $PROD_URI"
           echo "=============================="
 
-          # Pull the exact image built and verified on push-to-main
           docker pull "$STAGING_URI"
 
-          # Retag for prod repo — identical bits, zero rebuild
           docker tag "$STAGING_URI" "$PROD_URI"
           docker tag "$STAGING_URI" "$PROD_LATEST"
           docker push "$PROD_URI"
           docker push "$PROD_LATEST"
 
-          echo "image_uri=$PROD_URI" >> $GITHUB_OUTPUT
-          echo "image_tag=$TAG"      >> $GITHUB_OUTPUT
+          # Only output the tag — URI is reconstructed downstream
+          # to avoid GitHub's environment gate output propagation bug
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
           echo "Promotion complete: $PROD_URI"
 
-      - name: Verify promote outputs are set
+      - name: Verify tag output is set
         run: |
-          URI="${{ steps.promote.outputs.image_uri }}"
           TAG="${{ steps.promote.outputs.image_tag }}"
-          if [ -z "$URI" ] || [ -z "$TAG" ]; then
-            echo "ERROR: promote step did not set outputs"
+          if [ -z "$TAG" ]; then
+            echo "ERROR: image_tag output not set"
             exit 1
           fi
-          echo "Verified — image_uri: $URI"
           echo "Verified — image_tag: $TAG"
 
   # ─────────────────────────────────────────────
   # Job 3: Manual approval gate
-  # Requires GitHub environment "production" with
-  # a required reviewer in repo Settings → Environments.
-  # Forwards outputs so deploy-production can read them.
+  # environment: production pauses here for reviewer.
+  # Forwards ONLY image_tag — not image_uri.
   # ─────────────────────────────────────────────
   production-approval:
     name: Awaiting Production Approval
@@ -143,17 +134,16 @@ jobs:
     environment: production
 
     outputs:
-      image_uri: ${{ needs.promote-image.outputs.image_uri }}
       image_tag: ${{ needs.promote-image.outputs.image_tag }}
 
     steps:
-      - name: Confirm approved image
+      - name: Confirm approved image tag
         run: |
+          TAG="${{ needs.promote-image.outputs.image_tag }}"
           echo "Production deployment approved."
-          echo "Image URI : ${{ needs.promote-image.outputs.image_uri }}"
-          echo "Image tag : ${{ needs.promote-image.outputs.image_tag }}"
-          if [ -z "${{ needs.promote-image.outputs.image_uri }}" ]; then
-            echo "ERROR: image_uri is empty — cannot proceed"
+          echo "Image tag : $TAG"
+          if [ -z "$TAG" ]; then
+            echo "ERROR: image_tag is empty — cannot proceed"
             exit 1
           fi
 
@@ -179,6 +169,11 @@ jobs:
 
   # ─────────────────────────────────────────────
   # Job 4: Deploy to production + auto-rollback
+  #
+  # Reconstructs the prod image URI from secrets + tag
+  # instead of relying on job outputs — this avoids the
+  # GitHub environment gate output propagation bug where
+  # image_uri arrives empty after the approval wait.
   # ─────────────────────────────────────────────
   deploy-production:
     name: Deploy to Production
@@ -196,26 +191,38 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      - name: Resolve image URI
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Reconstruct and validate image URI
         id: image
         run: |
-          IMAGE_URI="${{ needs.promote-image.outputs.image_uri }}"
-          IMAGE_TAG="${{ needs.promote-image.outputs.image_tag }}"
-
-          if [ -z "$IMAGE_URI" ]; then
-            IMAGE_URI="${{ needs.production-approval.outputs.image_uri }}"
-            IMAGE_TAG="${{ needs.production-approval.outputs.image_tag }}"
-            echo "Used forwarded outputs from production-approval"
+          # Resolve tag — try promote-image first, fallback to production-approval
+          TAG="${{ needs.promote-image.outputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ needs.production-approval.outputs.image_tag }}"
+            echo "Used tag from production-approval output"
           fi
 
-          if [ -z "$IMAGE_URI" ]; then
-            echo "ERROR: image_uri is empty — aborting deployment"
+          if [ -z "$TAG" ]; then
+            echo "ERROR: image_tag is empty from all upstream jobs"
             exit 1
           fi
 
+          # Reconstruct URI from ECR registry (from login step) + secrets + tag
+          # This is always correct — no dependency on passed-through job outputs
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          PROD_REPO="${{ secrets.ECR_REPOSITORY_PROD }}"
+          IMAGE_URI="$REGISTRY/$PROD_REPO:$TAG"
+
+          echo "=============================="
+          echo "Tag      : $TAG"
+          echo "Image URI: $IMAGE_URI"
+          echo "=============================="
+
           echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
-          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "Deploying: $IMAGE_URI"
+          echo "tag=$TAG"       >> $GITHUB_OUTPUT
 
       - name: Save current task definition (rollback target)
         id: rollback-target
